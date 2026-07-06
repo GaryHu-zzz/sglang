@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 import torch
 import tqdm
 
+from sglang.srt.compilation.compile_phase import set_pcg_hicache_consumer_index
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
@@ -348,6 +349,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
 
+    def _make_graph_key(
+        self, num_tokens: int, hicache_consumer_index: Optional[int] = None
+    ):
+        return ShapeKey(
+            size=num_tokens,
+            hicache_consumer_index=hicache_consumer_index,
+        )
+
     def _next_token_logits_buffer(self, rows: int) -> Optional[torch.Tensor]:
         if not self.model_runner.pp_group.is_last_rank:
             return None
@@ -540,6 +549,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     return False
         if num_tokens > self.max_num_tokens:
             return False
+        static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        graph_key = self._make_graph_key(
+            static_num_tokens,
+            self._runtime_hicache_consumer_index(forward_batch),
+        )
+        if not self.backend.can_run(forward_batch, graph_key):
+            return False
         # No backend-level shape check here: load_batch bucket-pads
         # num_tokens up to the nearest captured shape, so eligibility is
         # bounded by num_tokens <= self.max_num_tokens (already
@@ -724,9 +740,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 capture_range.set_description(
                     f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
-            self.capture_one_shape(num_tokens)
+            for hicache_consumer_index in self._hicache_capture_consumer_indices():
+                with (
+                    self._hicache_capture_consumer_scope(hicache_consumer_index),
+                    set_pcg_hicache_consumer_index(hicache_consumer_index),
+                ):
+                    self.capture_one_shape(num_tokens, hicache_consumer_index)
 
-    def capture_one_shape(self, size: int) -> None:
+    def capture_one_shape(
+        self, size: int, hicache_consumer_index: Optional[int] = None
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
@@ -752,7 +775,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
         self.backend.capture_one(
-            ShapeKey(size=num_tokens),
+            self._make_graph_key(num_tokens, hicache_consumer_index),
             run_once,
             dummies=None,
             post_warmup_hook=post_warmup_hook,
@@ -865,6 +888,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
+            hicache_consumer_index=forward_batch.hicache_consumer_index,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
             temperature=forward_batch.temperature,
@@ -904,6 +928,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         self._static_num_tokens = static_num_tokens
+        self._replay_hicache_consumer_index = self._runtime_hicache_consumer_index(
+            forward_batch
+        )
         return static_forward_batch
 
     def execute(
@@ -913,6 +940,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
+            hicache_consumer_index = self._replay_hicache_consumer_index
 
             if self.layer_model is not None:
                 # BCG path. The captured graph is a bs=1 replay of
@@ -922,7 +950,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # model.forward eagerly with the live multi-req
                 # static_forward_batch. The outer's logits_processor /
                 # pooler then runs on top with live multi-req metadata.
-                shape_key = ShapeKey(size=self._static_num_tokens)
+                shape_key = self._make_graph_key(
+                    self._static_num_tokens, hicache_consumer_index
+                )
                 static_n = self._static_num_tokens
 
                 ie_idx = self._input_embeds_arg_idx
@@ -965,6 +995,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                             num_tokens=static_num_tokens,
                             raw_num_tokens=raw_num_tokens,
                         ),
+                        set_pcg_hicache_consumer_index(hicache_consumer_index),
                     ):
                         output = self.model_runner.model.forward(
                             static_forward_batch.input_ids,
@@ -992,9 +1023,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         num_tokens=static_num_tokens,
                         raw_num_tokens=raw_num_tokens,
                     ),
+                    set_pcg_hicache_consumer_index(hicache_consumer_index),
                 ):
                     output = self.backend.replay(
-                        self._static_num_tokens, static_forward_batch, **kwargs
+                        self._make_graph_key(
+                            self._static_num_tokens, hicache_consumer_index
+                        ),
+                        static_forward_batch,
+                        **kwargs,
                     )
 
             if isinstance(output, LogitsProcessorOutput):

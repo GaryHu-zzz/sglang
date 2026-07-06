@@ -20,7 +20,7 @@ import gc
 import logging
 from abc import abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import get_flags, get_parallel
@@ -147,6 +147,47 @@ class BaseCudaGraphRunner(BaseRunner):
         )
         index = bisect.bisect_left(buckets, raw_size)
         return buckets[index]
+
+    def _hicache_layer_transfer_counter(self):
+        token_to_kv_pool = getattr(self.model_runner, "token_to_kv_pool", None)
+        counter = getattr(token_to_kv_pool, "layer_transfer_counter", None)
+        if counter is None:
+            return None
+        if not hasattr(counter, "num_counters") or not hasattr(
+            counter, "prepare_cuda_graph_capture"
+        ):
+            return None
+        return counter
+
+    def _runtime_hicache_consumer_index(self, forward_batch: Any) -> Optional[int]:
+        consumer_index = getattr(forward_batch, "hicache_consumer_index", -1)
+        if consumer_index is None or consumer_index < 0:
+            return None
+        return consumer_index
+
+    def _hicache_capture_consumer_indices(self) -> List[Optional[int]]:
+        counter = self._hicache_layer_transfer_counter()
+        if counter is None:
+            return [None]
+        return [None, *range(counter.num_counters)]
+
+    @contextmanager
+    def _hicache_capture_consumer_scope(self, consumer_index: Optional[int]):
+        counter = self._hicache_layer_transfer_counter()
+        if counter is None:
+            yield
+            return
+
+        prev_consumer_index = counter.consumer_index
+        try:
+            if consumer_index is None:
+                counter.set_consumer(-1)
+            else:
+                counter.prepare_cuda_graph_capture(consumer_index)
+                counter.set_consumer(consumer_index)
+            yield
+        finally:
+            counter.set_consumer(prev_consumer_index)
 
     @abstractmethod
     def capture_prepare(self, size: int, *args, **kwargs) -> Any: ...

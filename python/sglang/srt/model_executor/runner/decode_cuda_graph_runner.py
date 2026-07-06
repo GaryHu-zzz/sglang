@@ -161,6 +161,7 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        hicache_consumer_index=getattr(forward_batch, "hicache_consumer_index", -1),
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
         # for the backend, which copies the result into its own static buffer and
         # reads THAT in the decode track-save — this slot is never mutated. None
@@ -389,11 +390,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
+    def _make_graph_key(
+        self,
+        bs,
+        stream_idx=None,
+        variant_label=None,
+        hicache_consumer_index=None,
+    ):
         return ShapeKey(
             size=bs,
             stream_idx=stream_idx,
             variant_label=variant_label,
+            hicache_consumer_index=hicache_consumer_index,
         )
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
@@ -420,15 +428,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = cuda_graph_bs
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
-
-        is_bs_supported = (
-            self.backend.can_run(forward_batch, graph_key)
-            if self.disable_padding
-            else cuda_graph_bs <= self.max_bs
-        )
+        if cuda_graph_bs > self.max_bs:
+            is_bs_supported = False
+        else:
+            padded_bs = (
+                cuda_graph_bs
+                if self.disable_padding
+                else self._pad_to_bucket(cuda_graph_bs, self.capture_bs)
+            )
+            variant_label = self._resolve_lora_variant(forward_batch)
+            stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+            graph_key = self._make_graph_key(
+                padded_bs,
+                stream_idx,
+                variant_label,
+                self._runtime_hicache_consumer_index(forward_batch),
+            )
+            is_bs_supported = self.backend.can_run(forward_batch, graph_key)
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
@@ -743,13 +759,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
-                with torch_compile_decoration.patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                for hicache_consumer_index in self._hicache_capture_consumer_indices():
+                    # HiCache slot graphs need the Python wait_event path to run
+                    # during CUDA graph capture.
+                    with torch_compile_decoration.patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs and hicache_consumer_index is None,
+                        num_tokens=bs * self.num_tokens_per_bs,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        with self._hicache_capture_consumer_scope(
+                            hicache_consumer_index
+                        ):
+                            self.capture_one_shape(
+                                bs,
+                                forward,
+                                stream_idx,
+                                variant_label,
+                                hicache_consumer_index,
+                            )
 
     def capture_one_shape(
         self,
@@ -757,6 +785,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        hicache_consumer_index: Optional[int] = None,
     ):
         bs = size
         num_tokens = bs * self.num_tokens_per_bs
@@ -852,7 +881,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
 
             with canary_ctx:
-                shape_key = self._make_graph_key(bs, stream_idx, variant_label)
+                shape_key = self._make_graph_key(
+                    bs, stream_idx, variant_label, hicache_consumer_index
+                )
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -927,7 +958,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                self.bs, stream_idx, variant_label
+                self.bs,
+                stream_idx,
+                variant_label,
+                self._runtime_hicache_consumer_index(forward_batch),
             )
             return
 
@@ -1003,7 +1037,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            self.bs, stream_idx, variant_label
+            self.bs,
+            stream_idx,
+            variant_label,
+            self._runtime_hicache_consumer_index(forward_batch),
         )
 
     def execute(

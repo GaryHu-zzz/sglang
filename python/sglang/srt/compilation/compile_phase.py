@@ -16,11 +16,13 @@ Two pieces of state, both private to the torch.compile path (the
 from __future__ import annotations
 
 from contextlib import contextmanager
+from typing import Optional
 
 import torch
 
 _in_torch_compile_warmup = False
 _pcg_capture_stream: torch.cuda.Stream | None = None
+_pcg_hicache_consumer_index: Optional[int] = None
 
 
 def is_in_torch_compile_warmup() -> bool:
@@ -47,6 +49,10 @@ def get_pcg_capture_stream() -> torch.cuda.Stream | None:
     return _pcg_capture_stream
 
 
+def get_pcg_hicache_consumer_index() -> Optional[int]:
+    return _pcg_hicache_consumer_index
+
+
 @contextmanager
 def set_pcg_capture_stream(stream: torch.cuda.Stream):
     global _pcg_capture_stream
@@ -55,3 +61,14 @@ def set_pcg_capture_stream(stream: torch.cuda.Stream):
         yield
     finally:
         _pcg_capture_stream = None
+
+
+@contextmanager
+def set_pcg_hicache_consumer_index(consumer_index: Optional[int]):
+    global _pcg_hicache_consumer_index
+    prev_consumer_index = _pcg_hicache_consumer_index
+    _pcg_hicache_consumer_index = consumer_index
+    try:
+        yield
+    finally:
+        _pcg_hicache_consumer_index = prev_consumer_index

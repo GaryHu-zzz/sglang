@@ -40,11 +40,10 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
 
     def __call__(self, *args):
         runtime_shape = args[self.sym_shape_indices[0]]
-        if runtime_shape not in self.concrete_size_entries:
+        entry = self.get_concrete_size_entry(runtime_shape)
+        if entry is None:
             # we don't need to do anything for this shape
             return self.compiled_graph_for_general_shape(*args)
-
-        entry = self.concrete_size_entries[runtime_shape]
 
         if entry.runnable is None:
             entry.runnable = self.compiled_graph_for_general_shape

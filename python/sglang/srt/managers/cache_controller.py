@@ -67,6 +67,11 @@ class LayerLoadingEvent:
     def wait(self, layer_index: int):
         device_module.current_stream().wait_event(self.load_events[layer_index])
 
+    def record_ready_for_cuda_graph_capture(self):
+        self.start_event.record()
+        for event in self.load_events:
+            event.record()
+
     @property
     def finish_event(self):
         return self.load_events[-1]
@@ -106,6 +111,11 @@ class LayerDoneCounter:
 
     def set_consumer(self, index: int):
         self.consumer_index = index
+
+    def prepare_cuda_graph_capture(self, index: int):
+        assert 0 <= index < self.num_counters
+        self.events[index].record_ready_for_cuda_graph_capture()
+        device_module.synchronize()
 
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:

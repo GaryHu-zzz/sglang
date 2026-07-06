@@ -29,8 +29,11 @@ class ShapeKey:
     stream_idx:   pdmux stream index, or None for single-stream runners.
     variant_label: LoRA-variant label ("lora" / "nolora"), or None
         for runners that don't record per-variant graphs.
+    hicache_consumer_index: HiCache layer-transfer event slot captured
+        into the graph, or None for the normal no-HiCache-load graph.
     """
 
     size: int
     stream_idx: Optional[int] = None
     variant_label: Optional[str] = None
+    hicache_consumer_index: Optional[int] = None

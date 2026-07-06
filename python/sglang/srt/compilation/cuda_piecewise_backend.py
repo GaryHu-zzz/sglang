@@ -15,6 +15,7 @@ from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.compile_phase import (
     get_pcg_capture_stream,
+    get_pcg_hicache_consumer_index,
     is_in_torch_compile_warmup,
 )
 from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
@@ -91,7 +92,7 @@ class CUDAPiecewiseBackend:
 
         # the entries for different shapes that we need to either
         # compile or capture cudagraph
-        self.concrete_size_entries: dict[int, ConcreteSizeEntry] = {}
+        self.concrete_size_entries: dict[Any, ConcreteSizeEntry] = {}
 
         # to_be_compiled_sizes tracks the remaining sizes to compile,
         # and updates during the compilation process, so we need to copy it
@@ -102,6 +103,35 @@ class CUDAPiecewiseBackend:
                 need_to_compile=shape in self.compile_sizes,
                 use_cudagraph=shape in self.cudagraph_capture_sizes,
             )
+
+    def _entry_key(self, runtime_shape: int) -> Any:
+        hicache_consumer_index = get_pcg_hicache_consumer_index()
+        if hicache_consumer_index is None:
+            return runtime_shape
+        return (runtime_shape, hicache_consumer_index)
+
+    def get_concrete_size_entry(self, runtime_shape: int) -> Optional[ConcreteSizeEntry]:
+        if (
+            runtime_shape not in self.compile_sizes
+            and runtime_shape not in self.cudagraph_capture_sizes
+        ):
+            return None
+
+        key = self._entry_key(runtime_shape)
+        entry = self.concrete_size_entries.get(key)
+        if entry is not None:
+            return entry
+
+        entry = ConcreteSizeEntry(
+            runtime_shape=runtime_shape,
+            need_to_compile=False,
+            use_cudagraph=runtime_shape in self.cudagraph_capture_sizes,
+        )
+        base_entry = self.concrete_size_entries.get(runtime_shape)
+        if base_entry is not None and base_entry.runnable is not None:
+            entry.runnable = base_entry.runnable
+        self.concrete_size_entries[key] = entry
+        return entry
 
     def check_for_ending_compilation(self):
         if self.is_last_graph and not self.to_be_compiled_sizes:
@@ -119,11 +149,10 @@ class CUDAPiecewiseBackend:
             return self.compiled_graph_for_general_shape(*args)
 
         runtime_shape = args[self.sym_shape_indices[0]]
-        if runtime_shape not in self.concrete_size_entries:
+        entry = self.get_concrete_size_entry(runtime_shape)
+        if entry is None:
             # we don't need to do anything for this shape
             return self.compiled_graph_for_general_shape(*args)
-
-        entry = self.concrete_size_entries[runtime_shape]
 
         if entry.runnable is None:
             entry.runnable = self.compiled_graph_for_general_shape
