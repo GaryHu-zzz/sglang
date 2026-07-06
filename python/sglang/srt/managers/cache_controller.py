@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -69,6 +70,20 @@ class LayerLoadingEvent:
     @property
     def finish_event(self):
         return self.load_events[-1]
+
+
+# ---- HiCache x cudagraph KV-correctness fix (env SGLANG_HICACHE_SYNC) ----
+# With cudagraph + HiCache + overlap all on, HiCache asynchronously reloads KV from host to device.
+# A captured cudagraph cannot replay HiCache's per-layer load wait_event, so a replayed forward can
+# consume KV whose async host->device load has NOT finished -> it reads incomplete/corrupt KV and the
+# generated output degrades (the format-error rate climbs). Under SGLANG_HICACHE_SYNC, HiCache
+# load/offload (1) wait on the PREVIOUS forward's completion event (HICACHE_FORWARD_EVENT, published by
+# the scheduler) rather than wait_stream() the live forward stream (which would stall under KV pressure,
+# as that forward must itself finish a HiCache load first), and (2) synchronize their stream so no
+# async transfer is in flight during a cudagraph replay -- the forward always sees fully-loaded KV
+# (slower, not wrong).
+HICACHE_FORWARD_EVENT = [None]
+_HICACHE_SYNC_LOGGED = {"load": False, "write": False}  # one-shot engaged-log markers
 
 
 class LayerDoneCounter:
@@ -692,6 +707,9 @@ class HiCacheController:
         finish_event = device_module.Event()
 
         start_event.record()
+        if envs.SGLANG_HICACHE_SYNC.get() and HICACHE_FORWARD_EVENT[0] is not None:
+            # [WAIT-FWD] offload waits the PREVIOUS forward, not the live one (see top).
+            self.write_stream.wait_event(HICACHE_FORWARD_EVENT[0])
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
             self.mem_pool_host.backup_from_device_all_layer(
@@ -713,6 +731,12 @@ class HiCacheController:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
 
+        # [WRITE-SYNC] serialize the device->host offload under SGLANG_HICACHE_SYNC (see top).
+        if envs.SGLANG_HICACHE_SYNC.get():
+            if not _HICACHE_SYNC_LOGGED["write"]:
+                logger.warning("[WRITE-SYNC] SGLANG_HICACHE_SYNC engaged: HiCache offload is now synchronous")
+                _HICACHE_SYNC_LOGGED["write"] = True
+            self.write_stream.synchronize()
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
     def load(
@@ -767,6 +791,9 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
+        if envs.SGLANG_HICACHE_SYNC.get() and HICACHE_FORWARD_EVENT[0] is not None:
+            # [WAIT-FWD] load waits the PREVIOUS forward, not the live one (see top).
+            self.load_stream.wait_event(HICACHE_FORWARD_EVENT[0])
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.layer_num):
@@ -794,6 +821,12 @@ class HiCacheController:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.load_stream)
 
+        # [RELOAD-SYNC] serialize the host->device reload under SGLANG_HICACHE_SYNC (see top).
+        if envs.SGLANG_HICACHE_SYNC.get():
+            if not _HICACHE_SYNC_LOGGED["load"]:
+                logger.warning("[RELOAD-SYNC] SGLANG_HICACHE_SYNC engaged: HiCache reload is now synchronous")
+                _HICACHE_SYNC_LOGGED["load"] = True
+            self.load_stream.synchronize()
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=producer_event.start_event,

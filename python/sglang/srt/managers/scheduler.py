@@ -3273,6 +3273,16 @@ class Scheduler(
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
+                        # [WAIT-FWD] publish this forward's completion event; HiCache's next-iter loads
+                        # wait on it instead of the live forward stream (see cache_controller).
+                        if self.enable_hierarchical_cache:
+                            try:
+                                from sglang.srt.managers import cache_controller
+                                forward_done_event = self.device_module.Event()
+                                forward_done_event.record(stream=self.forward_stream)
+                                cache_controller.HICACHE_FORWARD_EVENT[0] = forward_done_event
+                            except Exception:
+                                pass
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(future_indices, batch_result)
                             if _is_hip:
