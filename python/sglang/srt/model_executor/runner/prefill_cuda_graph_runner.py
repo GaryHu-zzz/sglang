@@ -514,6 +514,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if forward_batch.replace_embeds is not None:
             return False
+        # HiCache load in flight -> fall back to eager: a captured cudagraph cannot replay HiCache's
+        # per-layer load wait_event, so it would read not-yet-loaded KV. Eager honors the wait.
+        if getattr(forward_batch, "hicache_consumer_index", -1) >= 0:
+            return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if forward_batch.forward_mode.is_target_verify():
             return False

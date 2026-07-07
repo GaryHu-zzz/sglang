@@ -111,6 +111,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_DETOKENIZER_MAX_STATES` | Maximum states for detokenizer | Default value based on system |
 | `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK` | Enable checks for memory imbalance across Tensor Parallel ranks | `true` |
 | `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` | Configure the custom memory pool type for Mooncake. Supports `NVLINK`, `BAREX`, `INTRA_NODE_NVLINK`. If set to `true`, it defaults to `NVLINK`. | `None` |
+| `SGLANG_HICACHE_SYNC` | With cudagraph + HiCache + overlap on, a cudagraph replay can read KV whose async host->device HiCache load hasn't finished, corrupting output (higher format-error rate). Serialize HiCache reload/offload so the forward always sees fully-loaded KV. | `false` |
 
 ## Model-Specific Options
 

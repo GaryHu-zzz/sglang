@@ -409,6 +409,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
+        # HiCache load in flight -> fall back to eager: a captured cudagraph cannot replay HiCache's
+        # per-layer load wait_event, so it would read not-yet-loaded KV. Eager honors the wait.
+        if getattr(forward_batch, "hicache_consumer_index", -1) >= 0:
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs

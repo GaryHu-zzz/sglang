@@ -376,6 +376,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: config / flags (by-value) ===
     # For logprob
     return_logprob: bool = False
+    # HiCache: >= 0 while an async KV load this batch triggered is in flight (used to disable cudagraph
+    # for that batch so the per-layer load wait_event is honored in eager). -1 = no load in flight.
+    hicache_consumer_index: int = -1
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
     spec_algorithm: SpeculativeAlgorithm = None
@@ -701,6 +704,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             replace_positions=batch.replace_positions,
             # Scalar config / flags
             return_logprob=batch.return_logprob,
+            hicache_consumer_index=getattr(batch, "hicache_consumer_index", -1),
             is_extend_in_batch=batch.is_extend_in_batch,
             all_extend_in_batch=batch.all_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,

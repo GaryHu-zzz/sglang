@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -69,6 +70,24 @@ class LayerLoadingEvent:
     @property
     def finish_event(self):
         return self.load_events[-1]
+
+
+# ---- HiCache x cudagraph KV-correctness fix ----
+# With cudagraph + HiCache + overlap all on, a captured cudagraph cannot replay HiCache's per-layer
+# load/offload wait_event, so a replayed forward can race HiCache's async host<->device KV transfers
+# and read/reuse corrupt KV -> the generated output degrades (format-error rate climbs). Two distinct
+# races, fixed separately (measured: with cudagraph + HiCache eviction the format-error rate is ~150x
+# the cudagraph-off baseline; the two fixes below remove it while keeping cudagraph for plain decode):
+#   (a) LOAD race (forward consumes a not-yet-finished host->device reload): the batch that triggers a
+#       reload falls back to EAGER (can_run_graph rejects hicache_consumer_index >= 0), where the
+#       per-layer wait_until works. No reload-sync needed -> loads stay async / overlapped.
+#   (b) OFFLOAD race (a device->host eviction is still reading a KV slot that a cudagraph decode
+#       reuses): under SGLANG_HICACHE_SYNC the offload waits the PREVIOUS forward event
+#       (HICACHE_FORWARD_EVENT, published by the scheduler) and then synchronizes its write_stream so
+#       no offload is in flight when the freed slot is reused. Only the (infrequent) offload is
+#       serialized -> far cheaper than synchronizing every reload.
+HICACHE_FORWARD_EVENT = [None]
+_HICACHE_SYNC_LOGGED = {"load": False, "write": False}  # one-shot engaged-log markers
 
 
 class LayerDoneCounter:
@@ -692,6 +711,9 @@ class HiCacheController:
         finish_event = device_module.Event()
 
         start_event.record()
+        if envs.SGLANG_HICACHE_SYNC.get() and HICACHE_FORWARD_EVENT[0] is not None:
+            # [WAIT-FWD] offload waits the PREVIOUS forward, not the live one (see top).
+            self.write_stream.wait_event(HICACHE_FORWARD_EVENT[0])
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
             self.mem_pool_host.backup_from_device_all_layer(
@@ -713,6 +735,12 @@ class HiCacheController:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
 
+        # [WRITE-SYNC] serialize the device->host offload under SGLANG_HICACHE_SYNC (see top).
+        if envs.SGLANG_HICACHE_SYNC.get():
+            if not _HICACHE_SYNC_LOGGED["write"]:
+                logger.warning("[WRITE-SYNC] SGLANG_HICACHE_SYNC engaged: HiCache offload is now synchronous")
+                _HICACHE_SYNC_LOGGED["write"] = True
+            self.write_stream.synchronize()
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
     def load(

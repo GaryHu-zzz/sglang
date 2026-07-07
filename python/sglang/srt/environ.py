@@ -415,6 +415,10 @@ class Envs:
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    # With cudagraph + HiCache + overlap on, a cudagraph replay can read KV whose async host->device
+    # HiCache load hasn't finished -> corrupt KV, higher format-error rate. Serialize HiCache
+    # reload/offload so the forward always sees fully-loaded KV.
+    SGLANG_HICACHE_SYNC = EnvBool(False)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
